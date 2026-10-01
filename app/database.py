@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS readings (
 CREATE INDEX IF NOT EXISTS idx_readings_window_time
     ON readings(window_id, measured_at);
 
--- 每次提交（含同修订号幂等重放）都留痕，用于内容冲突检测
+-- 每次提交（含同修订号幂等重放）都留痕，用于内容冲突检测；
+-- 误采作废也作为该 ID 的一条修订（status='voided'）留存原因、操作时间与前一版本
 CREATE TABLE IF NOT EXISTS reading_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     window_id INTEGER NOT NULL REFERENCES windows(id),
@@ -58,7 +59,10 @@ CREATE TABLE IF NOT EXISTS reading_revisions (
     revision INTEGER NOT NULL,
     measured_at TEXT NOT NULL,
     temperature REAL NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded
+    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded | voided
+    void_reason TEXT,                       -- 作废原因（仅 voided 行）
+    voided_at TEXT,                         -- 作废操作时间（仅 voided 行）
+    prev_revision INTEGER,                  -- 被作废的前一版本修订号（仅 voided 行）
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE(window_id, reading_id, revision)
 );
@@ -79,6 +83,17 @@ CREATE INDEX IF NOT EXISTS idx_certificates_window
     ON certificates(window_id, version);
 """
 
+# 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
+# 这里按 PRAGMA table_info 检查后逐列 ALTER（幂等）。
+_COLUMN_MIGRATIONS = (
+    ("reading_revisions", "void_reason",
+     "ALTER TABLE reading_revisions ADD COLUMN void_reason TEXT"),
+    ("reading_revisions", "voided_at",
+     "ALTER TABLE reading_revisions ADD COLUMN voided_at TEXT"),
+    ("reading_revisions", "prev_revision",
+     "ALTER TABLE reading_revisions ADD COLUMN prev_revision INTEGER"),
+)
+
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or settings.db_path
@@ -95,8 +110,12 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """幂等建表。"""
+    """幂等建表；对已存在的旧库补齐作废相关列。"""
     conn.executescript(SCHEMA_SQL)
+    for table, column, ddl in _COLUMN_MIGRATIONS:
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(ddl)
     conn.commit()
 
 

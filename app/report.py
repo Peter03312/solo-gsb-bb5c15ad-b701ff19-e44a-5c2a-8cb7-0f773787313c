@@ -3,8 +3,8 @@
 仅依据两张**已签发证书的不可变快照**比对，不读取当前活动读数、不重查窗口：
 
 1. 读数级：按 reading_id 对齐两版快照，比较 revision / measured_at / temperature，
-   列出新增、变更（另附 removed 以保持结构完整；当前修订规则下读数只替换不
-   删除，正常流程中恒为空）。
+   列出新增、变更与移除（误采作废后再次签发的证书快照中该读数消失，计入
+   removed；恢复后再次签发则计入 added）。
 2. 时间线级：用两版各自快照里的窗口参数与读数，重建“带证据”的原始半开
    区段（采样保持、采样间隔超限未知、边界空白未知），再按两版全部区段
    边界的并集切分，输出**状态发生变化**的原子半开区间，给出变化前后状态
@@ -276,7 +276,10 @@ def _reading_key(r: dict[str, Any]) -> dict[str, Any]:
 
 def diff_readings(old_snap: dict[str, Any],
                   new_snap: dict[str, Any]) -> dict[str, Any]:
-    """按 reading_id 比较两版快照读数：新增 / 移除 / 变更。"""
+    """按 reading_id 比较两版快照读数：新增 / 移除 / 变更。
+
+    误采作废后再次签发的快照中该读数消失 -> removed；恢复后再次出现 -> added。
+    """
     old_map = {r["reading_id"]: _reading_key(r) for r in _snapshot_readings(old_snap)}
     new_map = {r["reading_id"]: _reading_key(r) for r in _snapshot_readings(new_snap)}
 

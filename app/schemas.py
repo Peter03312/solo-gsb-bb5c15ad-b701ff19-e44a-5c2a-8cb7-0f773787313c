@@ -85,12 +85,35 @@ class ReadingBatchSubmit(BaseModel):
     （活动读数与修订历史均不变）。每项沿用单条提交的 reading_id / revision /
     measured_at / temperature 语义与时区、窗口边界、修订规则；同批不得
     重复 reading_id；同刻唯一按“批次应用后的最终状态”校验，允许两条读数
-    以更高修订号互换采样时刻。
+    以更高修订号互换采样时刻。对已作废的 reading_id，批内以更高修订号
+    提交即恢复该读数（effect=restored）。
     """
 
     readings: list[ReadingSubmit] = Field(
         ..., min_length=1, description="非空读数批次（至少 1 项）；同批 reading_id 不得重复"
     )
+
+
+class ReadingVoidSubmit(BaseModel):
+    """作废一条误采读数：凭递增修订号 + 非空原因。
+
+    - revision 必须高于该读数当前修订号；作废本身作为该 ID 的一条修订
+      留存（原因、操作时间、前一版本），当前审定立即剔除该读数并重算。
+    - 相同作废修订号 + 相同原因重放 -> 幂等；相同修订号原因不同、
+      或修订号不高于当前 -> 409；读数从未存在 -> 404；
+      已作废的读数不能再次以新修订号作废 -> 409。
+    """
+
+    revision: int = Field(..., ge=1, description="作废修订号，必须高于该读数当前修订号")
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="作废原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("作废原因不能为空（不能只含空白字符）")
+        return v
 
 
 class IssueRequest(BaseModel):
@@ -142,23 +165,65 @@ class WindowOut(BaseModel):
 
 
 class ReadingSubmitResponse(BaseModel):
-    effect: str = Field(..., description="created | updated | idempotent")
+    effect: str = Field(..., description="created | updated | restored | idempotent")
     reading: ReadingOut
     current_evaluation: EvaluationOut
 
 
 class ReadingBatchItemResult(BaseModel):
-    effect: str = Field(..., description="created | updated | idempotent")
+    effect: str = Field(..., description="created | updated | restored | idempotent")
     reading: ReadingOut
 
 
 class ReadingBatchSubmitResponse(BaseModel):
     results: list[ReadingBatchItemResult] = Field(
-        ..., description="逐项结果，顺序与请求一致；每项给出 created/updated/idempotent 及最终读数"
+        ..., description="逐项结果，顺序与请求一致；每项给出 created/updated/restored/idempotent 及最终读数"
     )
     current_evaluation: EvaluationOut = Field(
         ..., description="按批次最终状态一次性重算的审定结果"
     )
+
+
+# ------------------------------------------------------------ 误采作废
+
+class VoidedPreviousOut(BaseModel):
+    """被作废的前一版本读数内容。"""
+
+    revision: int
+    measured_at: str
+    temperature: float
+
+
+class VoidRecordOut(BaseModel):
+    """作废修订记录：作废作为该 ID 的一条修订留存。"""
+
+    reading_id: str
+    revision: int = Field(..., description="作废修订号")
+    status: str = Field(..., description="固定为 voided")
+    reason: str = Field(..., description="作废原因")
+    voided_at: str = Field(..., description="作废操作时间（UTC）")
+    previous: VoidedPreviousOut = Field(..., description="被作废的前一版本读数")
+
+
+class ReadingVoidResponse(BaseModel):
+    effect: str = Field(..., description="voided | idempotent")
+    void: VoidRecordOut
+    current_evaluation: EvaluationOut = Field(
+        ..., description="剔除该读数后立即重算的审定结果"
+    )
+
+
+class ReadingRevisionOut(BaseModel):
+    """读数修订历史行（含作废记录）。"""
+
+    revision: int
+    status: str = Field(..., description="active | superseded | voided")
+    measured_at: str
+    temperature: float
+    created_at: str
+    void_reason: Optional[str] = Field(None, description="作废原因（仅 voided 行）")
+    voided_at: Optional[str] = Field(None, description="作废操作时间（仅 voided 行）")
+    prev_revision: Optional[int] = Field(None, description="被作废的前一版本修订号（仅 voided 行）")
 
 
 class CertificateOut(BaseModel):

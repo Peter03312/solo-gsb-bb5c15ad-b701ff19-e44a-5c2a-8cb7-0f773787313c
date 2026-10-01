@@ -136,3 +136,60 @@ api POST "/api/v1/windows/$BID/readings/batch" '{
   ]
 }' || true
 api POST "/api/v1/windows/$BID/readings/batch" '{"readings":[]}' || true
+
+echo "== 14. 误采作废与恢复（窗口 $WID 上演示）=="
+echo "-- 14.1 作废 r-03（当前 rev1）：更高修订号 rev2 + 非空原因；当前审定立即剔除并重算 --"
+api POST "/api/v1/windows/$WID/readings/r-03/void" \
+  '{"revision":2,"reason":"误采：该时刻传感器未校准"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect']);print('void:',json.dumps(d['void'],ensure_ascii=False));print('verdict:',d['current_evaluation']['verdict'],'reading_count:',d['current_evaluation']['reading_count'])"
+
+echo "-- 14.2 相同作废修订号+相同原因重放 -> 幂等（不产生新修订）--"
+api POST "/api/v1/windows/$WID/readings/r-03/void" \
+  '{"revision":2,"reason":"误采：该时刻传感器未校准"}' \
+  | python3 -c "import sys,json;print('effect:',json.load(sys.stdin)['effect'])"
+
+echo "-- 14.3 拒绝路径：同修订号不同原因 409 / 低修订号 409 / 从未存在 404 / 已作废再以新修订号作废 409 / 空原因 422 --"
+api POST "/api/v1/windows/$WID/readings/r-03/void" '{"revision":2,"reason":"另一个原因"}' || true
+api POST "/api/v1/windows/$WID/readings/r-03/void" '{"revision":1,"reason":"x"}' || true
+api POST "/api/v1/windows/$WID/readings/ghost/void" '{"revision":1,"reason":"x"}' || true
+api POST "/api/v1/windows/$WID/readings/r-03/void" '{"revision":3,"reason":"再次作废"}' || true
+api POST "/api/v1/windows/$WID/readings/r-03/void" '{"revision":3,"reason":"   "}' || true
+
+echo "-- 14.4 修订历史：作废作为该 ID 的修订留存（原因/操作时间/前一版本）--"
+api GET "/api/v1/windows/$WID/readings/r-03/revisions" | python3 -m json.tool
+
+echo "-- 14.5 签发 v3 反映作废；修订影响报告 v2->v3 呈现 r-03 移除（removed）--"
+api POST "/api/v1/windows/$WID/certificates/issue" '{"note":"作废 r-03 后签发"}' >/dev/null
+CV=$(api GET "/api/v1/windows/$WID/certificates" \
+  | python3 -c "import sys,json;cs=json.load(sys.stdin);print(cs[-2]['id'],cs[-1]['id'])")
+read -r V2_ID V3_ID <<< "$CV"
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$V2_ID&new_certificate_id=$V3_ID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin)['readings_diff'];print('removed:',[r['reading_id'] for r in d['removed']],'added:',[r['reading_id'] for r in d['added']])"
+
+echo "-- 14.6 旧版提交不得复活：重放作废前 rev1 -> 409 --"
+api POST "/api/v1/windows/$WID/readings" '{"reading_id":"r-03","revision":1,"measured_at":"2026-10-01T00:30:00Z","temperature":20.5}' || true
+
+echo "-- 14.7 恢复：提交更高修订号 rev3（effect=restored，立即重算）--"
+api POST "/api/v1/windows/$WID/readings" \
+  '{"reading_id":"r-03","revision":3,"measured_at":"2026-10-01T00:30:00Z","temperature":20.4}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'rev:',d['reading']['revision'],'verdict:',d['current_evaluation']['verdict'])"
+
+echo "-- 14.8 签发 v4 反映恢复；报告 v3->v4 呈现 r-03 再出现（added）；v3 快照保持原样 --"
+api POST "/api/v1/windows/$WID/certificates/issue" '{"note":"恢复 r-03 后签发"}' >/dev/null
+CV=$(api GET "/api/v1/windows/$WID/certificates" \
+  | python3 -c "import sys,json;cs=json.load(sys.stdin);print(cs[-2]['id'],cs[-1]['id'])")
+read -r V3_ID V4_ID <<< "$CV"
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$V3_ID&new_certificate_id=$V4_ID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin)['readings_diff'];print('added:',[r['reading_id'] for r in d['added']],'removed:',[r['reading_id'] for r in d['removed']])"
+api GET "/api/v1/certificates/$V3_ID" \
+  | python3 -c "import sys,json;print('v3 快照读数（仍无 r-03）:',[r['reading_id'] for r in json.load(sys.stdin)['snapshot']['readings']])"
+
+echo "-- 14.9 批量恢复：作废 r-40/r-50 后整批以更高修订号恢复（均 restored）--"
+api POST "/api/v1/windows/$WID/readings/r-40/void" '{"revision":2,"reason":"误采"}' >/dev/null
+api POST "/api/v1/windows/$WID/readings/r-50/void" '{"revision":2,"reason":"误采"}' >/dev/null
+api POST "/api/v1/windows/$WID/readings/batch" '{
+  "readings": [
+    {"reading_id":"r-40","revision":3,"measured_at":"2026-10-01T00:40:00Z","temperature":20.0},
+    {"reading_id":"r-50","revision":3,"measured_at":"2026-10-01T00:50:00Z","temperature":20.0}
+  ]
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('effects:',[x['effect'] for x in d['results']],'reading_count:',d['current_evaluation']['reading_count'])"
