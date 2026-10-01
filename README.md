@@ -4,8 +4,10 @@
 以“每条读数只覆盖到下一条读数”的采样保持语义切分区段，识别 **正常 / 超限 / 未知**
 区段，计算**最长连续超限时长**，并给出审定结论；支持读数幂等提交、修订替换、
 **采样仪器按审定窗口批量补传（整批事务、互换时刻、重放不产生新修订）**、
+**馆员作废与恢复（误采确认：作废作为该 ID 的修订留存原因/操作时间/前一版本，
+当前审定立即剔除重算；更高修订号提交即恢复）**、
 证书版本化签发（快照不可变），并可对同一审定窗口的两张已签发证书生成
-**修订影响报告**（只读快照比对：读数新增/变更、时间线状态变化半开区间、
+**修订影响报告**（只读快照比对：读数新增/变更/移除、时间线状态变化半开区间、
 结论与最长连续超限时长变化）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2
@@ -57,14 +59,54 @@
 - 同一窗口内不同读数不允许同一时间戳 → **422 拒收**。
 - 时间戳超出 `[start_at, end_at]` → **422 拒收**；所有时间戳必须带时区。
 
-### 批量补传（采样仪器）
+### 馆员作废与恢复（误采确认）
 
+馆员确认某条记录为误采时，`POST /api/v1/windows/{id}/readings/{reading_id}/void`
+凭**窗口、reading_id、递增修订号和非空原因**作废当前读数：
+
+- 作废作为该 ID 的一条**修订**（`status=voided`）留存：**原因、操作时间、
+  前一版本**（被作废读数的修订号/采样时刻/温度）；当前审定**立即剔除该读数
+  并在同一事务内重算**（响应含 `current_evaluation`），被释放的时刻可被
+  其它读数使用。
+- **相同作废修订号 + 相同原因重放幂等**（`effect: idempotent`，不产生新修订行）；
+  原因不同或修订号不更高（等于/低于当前修订号）→ 按现有 **409** 语义拒绝。
+- 读数**从未存在** → **404**；**已作废的读数不能再次以新修订号作废** → **409**。
+- **恢复**：后续单条或批量提交**更高修订号**即可恢复该 ID
+  （`effect: restored`），恢复须遵守窗口闭区间边界与（批量）最终状态同刻唯一
+  约束；**旧版提交（等/低于作废修订号）不得复活读数** → **409**；
+  批量中任一项冲突整批回滚（活动读数与修订历史均不变）。
+- 恢复后可再次以更高修订号作废（新的作废留存新的前一版本）。
+- **已签发证书快照保持原样**；后续签发反映作废或恢复（快照只含当前活动读数），
+  修订影响报告随之呈现读数**移除**（`removed`）或**再出现**（`added`）。
+- `GET /api/v1/windows/{id}/readings/{reading_id}/revisions` 查看该 ID 的
+  全部修订历史（含作废留存），按修订号升序。
+
+作废请求体与响应：
+
+```json
+// POST /api/v1/windows/1/readings/b/void
+// 请求：{ "revision": 2, "reason": "误采：传感器未校准" }
+{
+  "effect": "voided",
+  "reading_id": "b",
+  "revision": 2,
+  "void": {
+    "reason": "误采：传感器未校准",
+    "voided_at": "2026-10-01T01:23:45.123456Z",
+    "previous": {"revision": 1, "measured_at": "2026-10-01T00:01:00Z", "temperature": 23.0}
+  },
+  "current_evaluation": { "verdict": "pending", "...": "..." }
+}
+```
+
+### 批量补传（采样仪器）
 `POST /api/v1/windows/{id}/readings/batch` 在**单个写事务**内整批提交一个
 **非空**读数批次（请求体 `{"readings": [...]}`，单项结构与单条提交完全相同）：
 
 - 每项沿用现有 `reading_id`、`revision`、`measured_at`、`temperature`，
   以及单条提交的时区、窗口闭区间边界、幂等/修订/冲突语义；
-  **同批不得重复 `reading_id`**（否则 **422**）。
+  **同批不得重复 `reading_id`**（否则 **422**）；
+  对已作废的 ID，更高修订号即**恢复**（`restored`），等/低修订号 **409**。
 - 同刻唯一按**批次应用后的最终状态**校验，而不是按写入顺序逐条校验：
   因此允许两条读数都以更高修订号**互换采样时刻**（`a`、`b` 互相改到对方
   原时刻），不会因中间状态误拒；最终状态下仍同刻则 **422 拒收**。
@@ -72,9 +114,9 @@
   （**422**：窗口外、缺时区、最终状态同刻、批内重复 ID 等）→
   **整批拒收**：活动读数与修订历史均不改变（沿用现有冲突与校验错误语义）。
 - 成功时**一次提交全部变化**，响应逐项给出 `created` / `updated` /
-  `idempotent` 及最终读数（顺序与请求一致），并返回**按最终状态一次性重算**
-  的审定结果 `current_evaluation`；**同批重放不产生新修订**（全部
-  `idempotent`，历史表不新增行）。
+  `restored` / `idempotent` 及最终读数（顺序与请求一致），并返回
+  **按最终状态一次性重算**的审定结果 `current_evaluation`；**同批重放
+  不产生新修订**（全部 `idempotent`，历史表不新增行）。
 - 批量补传与单条提交、证书签发互不影响：已签发证书快照不可变，补传后
   再次签发形成新版本，旧版本内容保持不变。
 
@@ -167,9 +209,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/v1/windows/{id}/readings` | 提交/幂等重放/修订一条读数，响应含重算结果 |
+| `POST` | `/api/v1/windows/{id}/readings` | 提交/幂等重放/修订一条读数（对已作废 ID 用更高修订号即恢复），响应含重算结果 |
 | `POST` | `/api/v1/windows/{id}/readings/batch` | 采样仪器补传：整批提交非空读数批次（整批事务），逐项返回 effect 与最终读数，响应含按最终状态重算的结果 |
-| `GET` | `/api/v1/windows/{id}/readings` | 当前活动读数列表（按时间升序） |
+| `POST` | `/api/v1/windows/{id}/readings/{reading_id}/void` | 馆员作废：递增修订号 + 非空原因；作废修订留存原因/操作时间/前一版本，当前审定立即剔除重算 |
+| `GET` | `/api/v1/windows/{id}/readings` | 当前活动读数列表（按时间升序；不含已作废） |
+| `GET` | `/api/v1/windows/{id}/readings/{reading_id}/revisions` | 该 ID 全部修订历史（含作废留存），按修订号升序 |
 
 读数请求体：
 
@@ -178,7 +222,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   "measured_at": "2026-10-01T00:10:00Z", "temperature": 22.4 }
 ```
 
-单条提交响应中的 `effect` 为 `created` / `updated` / `idempotent`。
+单条提交响应中的 `effect` 为 `created` / `updated` / `restored` / `idempotent`
+（`restored` 表示以更高修订号恢复了已作废的 ID）。
 
 批量补传请求体与响应：
 
@@ -232,8 +277,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   - `changed`：两版都存在但读数有变化的项，含 `before`/`after` 全量值与
     `changed_fields`（`revision` / `measured_at` / `temperature` 子集，
     采样时间按时刻比较，时区表示不同不视为变化）；
-  - `removed`：新版消失的读数（当前修订规则只替换不删除，正常流程恒为空，
-    字段保留以防数据异常时显式暴露）。
+  - `removed`：新版消失的读数（被馆员作废的读数在此呈现；
+    恢复后再出现时计入 `added`）。
 - `timeline.changes`：用两版快照参数与读数各自重建半开覆盖区段
   （与第 1 节同一条采样保持/间隔超限/边界空白规则），取两版**全部区段边界
   的并集**切分后，只保留**状态发生变化**的半开区间，每个区间给出：
@@ -307,11 +352,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### 错误约定
 
-- `404`：窗口/证书不存在（修订影响报告中任一证书缺失）
-- `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）
+- `404`：窗口/证书不存在（修订影响报告中任一证书缺失）；
+  作废或查询修订历史时读数从未存在
+- `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）；
+  作废修订号重放但原因不同；以等/低修订号作废；已作废读数再次以新修订号
+  作废；以等/低于作废修订号的提交试图恢复读数
 - `422`：无效窗口、窗口外读数、同刻不同读数（批量按最终状态判定）、
-  批量请求为空批次/同批 `reading_id` 重复、缺时区/字段非法等；
-  修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422
+  批量请求为空批次/同批 `reading_id` 重复、缺时区/字段非法、
+  作废原因为空等；修订影响报告的两证书相同、跨审定窗口、
+  版本未按先后排列也返回 422
 
 > 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
 > 不会出现“批内前几项已生效、后几项失败”的部分写入。
@@ -323,10 +372,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 作废/恢复）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、作废/恢复）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -369,6 +418,30 @@ curl -sS http://localhost:8000/api/v1/windows/1/readings/batch \
 # 原样重放同一批次 -> results 全部 idempotent，不产生新修订
 ```
 
+馆员作废与恢复最小示例（接上文窗口 1 与读数 a）：
+
+```bash
+# 作废：递增修订号 + 非空原因；当前审定立即剔除 a 并重算
+curl -sS -X POST http://localhost:8000/api/v1/windows/1/readings/a/void \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":2,"reason":"误采：传感器未校准"}'
+# -> {"effect":"voided","void":{"reason":"...","voided_at":"...","previous":{"revision":1,...}},...}
+
+# 相同作废修订号+原因原样重放 -> effect=idempotent；换原因或低修订号 -> 409
+curl -sS -X POST http://localhost:8000/api/v1/windows/1/readings/a/void \
+  -H 'Content-Type: application/json' -d '{"revision":2,"reason":"误采：传感器未校准"}'
+
+# 查看该 ID 的修订历史（rev1 superseded、rev2 voided 含留存信息）
+curl -sS http://localhost:8000/api/v1/windows/1/readings/a/revisions
+
+# 恢复：以更高修订号重新提交（单条或批量均可）-> effect=restored
+curl -sS http://localhost:8000/api/v1/windows/1/readings \
+  -H 'Content-Type: application/json' \
+  -d '{"reading_id":"a","revision":3,"measured_at":"2026-10-01T00:00:00Z","temperature":20.1}'
+
+# 作废/恢复后再次签发形成新版本；修订影响报告的 removed/added 随之呈现
+```
+
 ---
 
 ## 5. 测试
@@ -387,6 +460,10 @@ PYTHONPATH=. python -m pytest tests/ -q
 - `tests/test_batch_api.py`：批量补传 HTTP 集成测试（整批创建/混合 effect、
   窗口外/同刻/重复 ID 整批原子回滚、409 冲突与旧修订号、活动表与历史表不变、
   更高修订号互换时刻及顺序无关、重放不产生新修订、已签发快照不变、时区归一）。
+- `tests/test_void_api.py`：馆员作废与恢复 HTTP 集成测试（作废留存与立即重算、
+  作废重放幂等、原因冲突/低修订号/重复作废 409、从未存在 404、空原因 422、
+  单条/批量恢复 restored、旧版提交不得复活、恢复遵守窗口边界与最终状态同刻、
+  批量冲突整批回滚、证书快照不变与报告 removed/added 呈现）。
 - `tests/test_report_api.py`：修订影响报告 HTTP 测试（fail→pass、
   边界空白 vs 采样间隔超限、只依快照、跨窗口/倒序/同 ID/不存在拒绝）。
 
@@ -400,7 +477,7 @@ app/
   report.py        # 修订影响报告（快照比对、时间线对齐，纯函数）
   models.py        # 结论枚举/常量
   schemas.py       # Pydantic 请求/响应模型
-  services.py      # 窗口、读数、审定、签发、修订影响报告业务逻辑
+  services.py      # 窗口、读数（含作废/恢复）、审定、签发、修订影响报告业务逻辑
   main.py          # FastAPI 路由
 examples/
   curl-examples.sh

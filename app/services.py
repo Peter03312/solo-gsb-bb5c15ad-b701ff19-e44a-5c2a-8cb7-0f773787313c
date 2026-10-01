@@ -1,16 +1,17 @@
-"""业务服务层：窗口、读数、审定、签发。"""
+"""业务服务层：窗口、读数（含作废/恢复）、审定、签发。"""
 from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import HTTPException, status
 
 from .evaluation import evaluate
-from .models import VERDICT_LABELS_ZH
+from .models import READING_VOIDED, VERDICT_LABELS_ZH
 from .report import build_revision_report
-from .schemas import ReadingBatchSubmit, ReadingSubmit, WindowCreate
+from .schemas import ReadingBatchSubmit, ReadingSubmit, ReadingVoidSubmit, WindowCreate
 from .timeutils import parse_stored, to_iso, to_utc
 
 
@@ -121,25 +122,43 @@ def submit_reading(
             )
         effect = "updated"
     else:
-        # 无活动行（全新读数）。history 唯一约束兜底，极端情况下可据其判幂等/冲突。
-        hist = conn.execute(
-            "SELECT * FROM reading_revisions WHERE window_id=? AND reading_id=? AND revision=?",
-            (window_id, payload.reading_id, payload.revision),
-        ).fetchone()
-        if hist is not None:
-            if hist["measured_at"] != measured_iso or float(hist["temperature"]) != temperature:
+        # 无活动行：全新读数，或该 ID 当前处于“已作废”状态（活动行已在作废时删除）
+        cur = _latest_revision_row(conn, window_id, payload.reading_id)
+        if cur is not None and cur["status"] == READING_VOIDED:
+            # 已作废：仅更高修订号可恢复该 ID；等/低修订号一律 409，旧版提交不得复活
+            if payload.revision <= cur["revision"]:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
-                        f"读数 {payload.reading_id} 修订号 {payload.revision} 历史内容冲突："
-                        f"({hist['measured_at']}, {hist['temperature']}) vs "
-                        f"({measured_iso}, {temperature})"
+                        f"读数 {payload.reading_id} 当前修订号为 {cur['revision']}（已作废），"
+                        f"拒绝修订号 {payload.revision}：恢复已作废读数必须使用更高修订号，"
+                        "旧修订号不得复活读数。"
                     ),
                 )
-            active_row = _insert_active(conn, window_id, payload.reading_id,
-                                        payload.revision, measured_iso, temperature)
-            return "idempotent", reading_to_dict(active_row)
-        effect = "created"
+            effect = "restored"
+        elif cur is not None:
+            # 活动行缺失但历史最新并非作废（异常兜底）：沿用原有幂等补齐语义。
+            # history 唯一约束兜底，极端情况下可据其判幂等/冲突。
+            hist = conn.execute(
+                "SELECT * FROM reading_revisions WHERE window_id=? AND reading_id=? AND revision=?",
+                (window_id, payload.reading_id, payload.revision),
+            ).fetchone()
+            if hist is not None:
+                if hist["measured_at"] != measured_iso or float(hist["temperature"]) != temperature:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"读数 {payload.reading_id} 修订号 {payload.revision} 历史内容冲突："
+                            f"({hist['measured_at']}, {hist['temperature']}) vs "
+                            f"({measured_iso}, {temperature})"
+                        ),
+                    )
+                active_row = _insert_active(conn, window_id, payload.reading_id,
+                                            payload.revision, measured_iso, temperature)
+                return "idempotent", reading_to_dict(active_row)
+            effect = "created"
+        else:
+            effect = "created"
 
     # 同刻不同读数拒收（UNIQUE(window_id, measured_at) 兜底；先给清晰报错）。
     # 更新自身读数且时间戳未变时不算冲突。
@@ -153,7 +172,8 @@ def submit_reading(
             detail=f"时刻 {measured_iso} 已存在读数 {clash['reading_id']}，同一窗口不允许同刻的不同读数",
         )
 
-    # 落库：新历史行（active）+ 活动表 upsert；旧历史行标记 superseded
+    # 落库：新历史行（active）+ 活动表 upsert；updated 时旧历史行标记 superseded
+    # （restored 时前一当前行是作废修订，保留其 voided 状态作为历史留存）
     if effect == "updated":
         conn.execute(
             "UPDATE reading_revisions SET status='superseded' "
@@ -205,6 +225,8 @@ def submit_reading_batch(
     - 同批 reading_id 不得重复（422）；
     - 同刻唯一按“批次全部应用后的最终状态”校验，因此允许两条读数都以更高
       修订号互换采样时刻，不按写入顺序误拒；
+    - 对已作废的 ID，更高修订号即恢复该读数（restored），同样须通过最终状态
+      同刻校验；等/低修订号不得复活（409）；
     - 校验全部通过后一次提交全部变化。
     """
     win = get_window_row(conn, window_id)
@@ -232,6 +254,12 @@ def submit_reading_batch(
     history: dict[tuple[str, int], sqlite3.Row] = {
         (r["reading_id"], r["revision"]): r for r in hist_rows
     }
+    # 每个 ID 修订号最大的历史行：判定该 ID 当前是否处于已作废状态
+    history_max: dict[str, sqlite3.Row] = {}
+    for r in hist_rows:
+        rid = r["reading_id"]
+        if rid not in history_max or r["revision"] > history_max[rid]["revision"]:
+            history_max[rid] = r
 
     # ---- 2) 逐项校验：窗口边界、修订号、内容冲突；得到最终状态 ----
     # final[reading_id] = (revision, measured_iso, temperature, effect)
@@ -278,7 +306,23 @@ def submit_reading_batch(
             final[p.reading_id] = (p.revision, measured_iso, temperature, effect)
             continue
 
-        # 无活动行（全新读数，或活动行缺失的历史异常场景）。
+        # 无活动行：全新读数，或该 ID 当前已作废（活动行缺失的异常场景也走这里）。
+        cur_max = history_max.get(p.reading_id)
+        if cur_max is not None and cur_max["status"] == READING_VOIDED:
+            # 已作废：仅更高修订号可恢复；等/低修订号整批拒收（旧版提交不得复活）
+            if p.revision <= cur_max["revision"]:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"读数 {p.reading_id} 当前修订号为 {cur_max['revision']}（已作废），"
+                        f"拒绝修订号 {p.revision}：恢复已作废读数必须使用更高修订号，"
+                        "旧修订号不得复活读数。"
+                    ),
+                )
+            effect = "restored"
+            final[p.reading_id] = (p.revision, measured_iso, temperature, effect)
+            continue
+
         hist = history.get((p.reading_id, p.revision))
         if hist is not None:
             if hist["measured_at"] != measured_iso or float(hist["temperature"]) != temperature:
@@ -315,6 +359,8 @@ def submit_reading_batch(
             )
 
     # ---- 4) 一次提交全部变化 ----
+    # updated：旧历史行标记 superseded；restored：前一当前行是作废修订，
+    # 保留其 voided 状态作为历史留存，不改动。
     updated_ids = [rid for rid, v in final.items() if v[3] == "updated"]
     if updated_ids:
         conn.executemany(
@@ -334,7 +380,7 @@ def submit_reading_batch(
         [
             (window_id, rid, rev, ts, temp)
             for rid, (rev, ts, temp, effect) in final.items()
-            if effect in ("created", "updated")
+            if effect in ("created", "updated", "restored")
         ],
     )
     # 先删除被替换的活动行、再统一插入：避免“互换时刻”时 readings 的
@@ -344,7 +390,7 @@ def submit_reading_batch(
             "DELETE FROM readings WHERE window_id=? AND reading_id=?",
             [(window_id, rid) for rid in updated_ids],
         )
-    insert_effects = ("created", "updated")
+    insert_effects = ("created", "updated", "restored")
     try:
         conn.executemany(
             """
@@ -388,6 +434,17 @@ def _insert_active(
     ).fetchone()
 
 
+def _latest_revision_row(
+    conn: sqlite3.Connection, window_id: int, reading_id: str
+) -> Optional[sqlite3.Row]:
+    """该 ID 修订号最大的历史行（决定其当前状态：active / voided）。"""
+    return conn.execute(
+        "SELECT * FROM reading_revisions WHERE window_id=? AND reading_id=? "
+        "ORDER BY revision DESC LIMIT 1",
+        (window_id, reading_id),
+    ).fetchone()
+
+
 def list_active_readings(conn: sqlite3.Connection, window_id: int) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM readings WHERE window_id=? ORDER BY measured_at ASC, reading_id ASC",
@@ -404,6 +461,172 @@ def reading_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "status": "active",
         "created_at": row["created_at"],
     }
+
+
+# ---------------------------------------------------------------- 读数作废
+
+def _void_detail(row: sqlite3.Row) -> dict[str, Any]:
+    """作废修订行的留存信息：原因、操作时间、前一版本。
+
+    作废行的 measured_at/temperature 列留存被作废前一版本的内容，
+    prev_revision 为其修订号。
+    """
+    return {
+        "reason": row["void_reason"],
+        "voided_at": row["voided_at"],
+        "previous": {
+            "revision": row["prev_revision"],
+            "measured_at": row["measured_at"],
+            "temperature": row["temperature"],
+        },
+    }
+
+
+def void_reading(
+    conn: sqlite3.Connection, window_id: int, reading_id: str,
+    payload: ReadingVoidSubmit,
+) -> tuple[str, dict[str, Any]]:
+    """作废当前读数：以递增修订号留存一条 voided 修订，活动读数立即剔除。
+
+    返回 (effect, void_detail)，effect 为 voided / idempotent。
+    调用方需已持有写事务；审定重算由调用方在同一事务内完成。
+    """
+    get_window_row(conn, window_id)  # 窗口不存在 -> 404
+    reason = payload.reason  # schema 已去除首尾空白并保证非空
+
+    active = conn.execute(
+        "SELECT * FROM readings WHERE window_id=? AND reading_id=?",
+        (window_id, reading_id),
+    ).fetchone()
+    cur = _latest_revision_row(conn, window_id, reading_id)
+
+    if cur is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"读数 {reading_id} 在窗口 {window_id} 中从未存在，无可作废的当前读数",
+        )
+
+    if active is None:
+        # 当前无活动读数：正常情形是该 ID 已作废（活动行已在作废时删除）
+        if cur["status"] == READING_VOIDED:
+            if payload.revision == cur["revision"]:
+                # 相同作废修订重放：原因一致幂等，不一致按内容冲突拒绝
+                if reason != cur["void_reason"]:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"读数 {reading_id} 作废修订号 {payload.revision} 已存在但内容冲突："
+                            f"已存原因「{cur['void_reason']}」，本次「{reason}」。"
+                            "相同作废修订号重放内容必须一致。"
+                        ),
+                    )
+                return "idempotent", _void_detail(cur)
+            if payload.revision < cur["revision"]:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"读数 {reading_id} 当前修订号为 {cur['revision']}（已作废），"
+                        f"拒绝作废修订号 {payload.revision}：旧修订号不能覆盖更高修订号。"
+                    ),
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"读数 {reading_id} 已处于作废状态（作废修订号 {cur['revision']}），"
+                    f"不能再次以新修订号 {payload.revision} 作废；"
+                    "如需恢复，请以更高修订号重新提交该读数。"
+                ),
+            )
+        # 异常兜底：历史最新并非作废但活动行缺失
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"读数 {reading_id} 当前无活动读数可作废（数据状态异常）。",
+        )
+
+    # 当前读数存在：作废须使用递增（更高）修订号
+    if payload.revision == active["revision"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"读数 {reading_id} 修订号 {payload.revision} 即当前读数版本，"
+                "相同 ID+修订号内容必须一致：作废请求与已提交的采样内容冲突；"
+                "作废须使用更高修订号。"
+            ),
+        )
+    if payload.revision < active["revision"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"读数 {reading_id} 当前修订号为 {active['revision']}，"
+                f"拒绝作废修订号 {payload.revision}：旧修订号不能覆盖更高修订号。"
+            ),
+        )
+
+    # 执行作废：当前修订标记 superseded，新增 voided 修订（留存原因、
+    # 操作时间、前一版本），并删除活动读数（当前审定立即剔除该读数）
+    voided_at = to_iso(datetime.now(timezone.utc))
+    conn.execute(
+        "UPDATE reading_revisions SET status='superseded' "
+        "WHERE window_id=? AND reading_id=? AND revision=?",
+        (window_id, reading_id, active["revision"]),
+    )
+    ins = conn.execute(
+        """
+        INSERT INTO reading_revisions (window_id, reading_id, revision, measured_at,
+                                       temperature, status, void_reason, voided_at,
+                                       prev_revision)
+        VALUES (?, ?, ?, ?, ?, 'voided', ?, ?, ?)
+        """,
+        (
+            window_id, reading_id, payload.revision,
+            active["measured_at"], active["temperature"],
+            reason, voided_at, active["revision"],
+        ),
+    )
+    conn.execute(
+        "DELETE FROM readings WHERE window_id=? AND reading_id=?",
+        (window_id, reading_id),
+    )
+    row = conn.execute(
+        "SELECT * FROM reading_revisions WHERE id=?", (ins.lastrowid,)
+    ).fetchone()
+    return "voided", _void_detail(row)
+
+
+def list_reading_revisions(
+    conn: sqlite3.Connection, window_id: int, reading_id: str
+) -> list[dict[str, Any]]:
+    """该 ID 的全部修订历史（含作废留存），按修订号升序。"""
+    get_window_row(conn, window_id)
+    rows = conn.execute(
+        "SELECT * FROM reading_revisions WHERE window_id=? AND reading_id=? "
+        "ORDER BY revision ASC",
+        (window_id, reading_id),
+    ).fetchall()
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"读数 {reading_id} 在窗口 {window_id} 中从未存在",
+        )
+    return [revision_to_dict(r) for r in rows]
+
+
+def revision_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "reading_id": row["reading_id"],
+        "revision": row["revision"],
+        "status": row["status"],
+        "measured_at": None,
+        "temperature": None,
+        "void": None,
+        "created_at": row["created_at"],
+    }
+    if row["status"] == READING_VOIDED:
+        data["void"] = _void_detail(row)
+    else:
+        data["measured_at"] = row["measured_at"]
+        data["temperature"] = row["temperature"]
+    return data
 
 
 # ---------------------------------------------------------------- 审定计算

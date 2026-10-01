@@ -136,3 +136,68 @@ api POST "/api/v1/windows/$BID/readings/batch" '{
   ]
 }' || true
 api POST "/api/v1/windows/$BID/readings/batch" '{"readings":[]}' || true
+
+echo "== 14. 馆员作废与恢复（误采确认）=="
+VW=$(api POST /api/v1/windows '{
+  "name": "展柜C-作废恢复",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T01:00:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600
+}')
+VID=$(echo "$VW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 14.1 提交读数：m-01 为误采超温（00:10->00:20 超限 600s -> fail），并签发 v1 --"
+api POST "/api/v1/windows/$VID/readings" '{"reading_id":"m-00","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$VID/readings" '{"reading_id":"m-01","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":23.5}' >/dev/null
+api POST "/api/v1/windows/$VID/readings" '{"reading_id":"m-02","revision":1,"measured_at":"2026-10-01T00:20:00Z","temperature":20.2}' >/dev/null
+api GET "/api/v1/windows/$VID/evaluation" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('作废前:',d['verdict'],d['max_continuous_exceeded_seconds'],'s')"
+VC1=$(api POST "/api/v1/windows/$VID/certificates/issue" '{"note":"作废前"}')
+VC1ID=$(echo "$VC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 14.2 作废 m-01（递增修订号 rev2 + 非空原因）：留存原因/操作时间/前一版本，当前审定立即剔除重算 --"
+api POST "/api/v1/windows/$VID/readings/m-01/void" \
+  '{"revision":2,"reason":"误采：传感器未校准"}' | python3 -m json.tool
+
+echo "-- 14.3 相同作废修订+原因重放 -> idempotent；换原因 -> 409；已作废再以新修订号作废 -> 409；从未存在 -> 404 --"
+api POST "/api/v1/windows/$VID/readings/m-01/void" \
+  '{"revision":2,"reason":"误采：传感器未校准"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('重放 effect:',d['effect'])"
+api POST "/api/v1/windows/$VID/readings/m-01/void" '{"revision":2,"reason":"另一个原因"}' || true
+api POST "/api/v1/windows/$VID/readings/m-01/void" '{"revision":3,"reason":"再次作废"}' || true
+api POST "/api/v1/windows/$VID/readings/ghost/void" '{"revision":1,"reason":"x"}' || true
+
+echo "-- 14.4 修订历史：rev1 superseded、rev2 voided（含作废留存）--"
+api GET "/api/v1/windows/$VID/readings/m-01/revisions" | python3 -m json.tool
+
+echo "-- 14.5 作废后签发 v2（快照剔除 m-01）；修订影响报告 v1->v2 呈现 removed；v1 快照不变 --"
+VC2=$(api POST "/api/v1/windows/$VID/certificates/issue" '{"note":"作废后"}')
+VC2ID=$(echo "$VC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$VC1ID&new_certificate_id=$VC2ID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('removed:',[r['reading_id'] for r in d['readings_diff']['removed']],'added:',[r['reading_id'] for r in d['readings_diff']['added']])"
+api GET "/api/v1/certificates/$VC1ID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('v1 快照读数（不变）:',sorted(r['reading_id'] for r in d['snapshot']['readings']))"
+
+echo "-- 14.6 恢复：更高修订号提交 -> restored，审定恢复 fail --"
+api POST "/api/v1/windows/$VID/readings" \
+  '{"reading_id":"m-01","revision":3,"measured_at":"2026-10-01T00:10:00Z","temperature":23.5}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'verdict:',d['current_evaluation']['verdict'])"
+
+echo "-- 14.7 再次作废（rev4）后：旧版提交（rev3）不得复活 -> 409；批量更高修订号恢复 -> restored --"
+api POST "/api/v1/windows/$VID/readings/m-01/void" '{"revision":4,"reason":"复核仍为误采"}' >/dev/null
+api POST "/api/v1/windows/$VID/readings" \
+  '{"reading_id":"m-01","revision":3,"measured_at":"2026-10-01T00:10:00Z","temperature":23.5}' || true
+api POST "/api/v1/windows/$VID/readings/batch" '{
+  "readings": [
+    {"reading_id":"m-01","revision":5,"measured_at":"2026-10-01T00:10:00Z","temperature":23.5}
+  ]
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('批量 effects:',[x['effect'] for x in d['results']])"
+
+echo "-- 14.8 恢复后签发 v3；修订影响报告 v2->v3 呈现 added（读数再出现）--"
+VC3=$(api POST "/api/v1/windows/$VID/certificates/issue" '{"note":"恢复后"}')
+VC3ID=$(echo "$VC3" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$VC2ID&new_certificate_id=$VC3ID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('added:',[(r['reading_id'],r['revision']) for r in d['readings_diff']['added']],'removed:',[r['reading_id'] for r in d['readings_diff']['removed']])"

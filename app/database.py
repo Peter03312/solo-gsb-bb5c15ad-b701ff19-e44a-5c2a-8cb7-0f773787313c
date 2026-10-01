@@ -50,7 +50,10 @@ CREATE TABLE IF NOT EXISTS readings (
 CREATE INDEX IF NOT EXISTS idx_readings_window_time
     ON readings(window_id, measured_at);
 
--- 每次提交（含同修订号幂等重放）都留痕，用于内容冲突检测
+-- 每次提交（含同修订号幂等重放）都留痕，用于内容冲突检测；
+-- 作废也是该 ID 的一条修订（status='voided'）：作废行的
+-- measured_at/temperature/prev_revision 留存被作废的前一版本，
+-- void_reason/voided_at 留存作废原因与操作时间
 CREATE TABLE IF NOT EXISTS reading_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     window_id INTEGER NOT NULL REFERENCES windows(id),
@@ -58,7 +61,10 @@ CREATE TABLE IF NOT EXISTS reading_revisions (
     revision INTEGER NOT NULL,
     measured_at TEXT NOT NULL,
     temperature REAL NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded
+    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded | voided
+    void_reason TEXT,                       -- 作废原因（仅 voided 行）
+    voided_at TEXT,                         -- 作废操作时间 ISO-8601 UTC（仅 voided 行）
+    prev_revision INTEGER,                  -- 被作废的前一版本修订号（仅 voided 行）
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE(window_id, reading_id, revision)
 );
@@ -79,6 +85,13 @@ CREATE INDEX IF NOT EXISTS idx_certificates_window
     ON certificates(window_id, version);
 """
 
+# 既有库（CREATE TABLE IF NOT EXISTS 不会变更已有表）需要补的列
+_READING_REVISIONS_NEW_COLUMNS = {
+    "void_reason": "void_reason TEXT",
+    "voided_at": "voided_at TEXT",
+    "prev_revision": "prev_revision INTEGER",
+}
+
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or settings.db_path
@@ -95,9 +108,20 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """幂等建表。"""
+    """幂等建表；对既有库补充作废相关列（幂等）。"""
     conn.executescript(SCHEMA_SQL)
+    _migrate_reading_revisions(conn)
     conn.commit()
+
+
+def _migrate_reading_revisions(conn: sqlite3.Connection) -> None:
+    """为既有数据库的 reading_revisions 表补充作废列（ALTER TABLE 幂等）。"""
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(reading_revisions)")
+    }
+    for name, ddl in _READING_REVISIONS_NEW_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE reading_revisions ADD COLUMN {ddl}")
 
 
 @contextmanager

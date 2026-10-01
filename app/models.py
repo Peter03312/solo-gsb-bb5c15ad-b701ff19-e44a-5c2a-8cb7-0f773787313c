@@ -25,6 +25,9 @@ VERDICT_LABELS_ZH = {
 }
 
 
-# reading 状态：每个（窗口, 读数 ID）只有一条 active，历史行保留在 reading_revisions
+# reading 状态：每个（窗口, 读数 ID）最多一条 active（当前生效修订）；
+# 历史行保留在 reading_revisions：superseded 为被更高修订号替换的旧版本，
+# voided 为作废修订（该 ID 当前无活动读数；恢复后该行作为历史作废留存）
 READING_ACTIVE = "active"
 READING_SUPERSEDED = "superseded"
+READING_VOIDED = "voided"

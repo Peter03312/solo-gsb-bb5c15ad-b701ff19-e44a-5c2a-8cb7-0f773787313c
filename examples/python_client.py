@@ -11,7 +11,9 @@
   3) 窗口外读数、同刻读数拒收；
   4) 首次签发、修订后再次签发形成新版本，旧版本快照保持不变；
   5) 采样仪器批量补传：整批事务、逐项 created/updated/idempotent、
-     互换采样时刻、整批冲突回滚、重放不产生新修订。
+     互换采样时刻、整批冲突回滚、重放不产生新修订；
+  6) 馆员作废与恢复：作废留存原因/操作时间/前一版本、立即重算、
+     作废重放幂等、更高修订号恢复（单条与批量）、报告呈现移除/再出现。
 """
 from __future__ import annotations
 
@@ -254,6 +256,83 @@ def main() -> None:
     assert code == 422
     ids_now = {x["reading_id"] for x in call("GET", f"/api/v1/windows/{wb}/readings")[1]}
     assert ids_now == {"a", "b", "c"}
+
+    # ---------- 馆员作废与恢复（误采确认） ----------
+    show("馆员作废与恢复：作废留存、立即重算、幂等重放、更高修订号恢复")
+    wv = create_window("展柜E-作废恢复", 10, max_exceed=300, max_gap=600)
+    for rid, m, temp in [("m0", 0, 20.0), ("m1", 1, 23.0), ("m2", 9, 20.0), ("m3", 10, 20.0)]:
+        assert submit(wv, rid, 1, m, temp)[0] == 201
+    ev = call("GET", f"/api/v1/windows/{wv}/evaluation")[1]
+    print("作废前:", summary(ev))
+    assert ev["verdict"] == "fail"  # m1 覆盖 [00:01,00:09) 超限 480s > 300
+    cv1 = call("POST", f"/api/v1/windows/{wv}/certificates/issue", {"note": "作废前"})[1]
+
+    # 作废：递增修订号 + 非空原因；响应含留存信息与立即重算结果
+    code, r = call("POST", f"/api/v1/windows/{wv}/readings/m1/void",
+                   {"revision": 2, "reason": "误采：传感器未校准"})
+    print("作废:", code, r["effect"], "->", summary(r["current_evaluation"]))
+    assert code == 201 and r["effect"] == "voided"
+    assert r["void"]["reason"] == "误采：传感器未校准"
+    assert r["void"]["previous"] == {"revision": 1,
+                                     "measured_at": "2026-10-01T00:01:00Z",
+                                     "temperature": 23.0}
+    assert r["current_evaluation"]["verdict"] == "pass"  # 剔除误采后满覆盖且正常
+    ids_now = {x["reading_id"] for x in call("GET", f"/api/v1/windows/{wv}/readings")[1]}
+    assert ids_now == {"m0", "m2", "m3"}
+
+    # 相同作废修订+原因重放幂等；原因不同/再次新修订号作废 -> 409；从未存在 -> 404
+    code, r = call("POST", f"/api/v1/windows/{wv}/readings/m1/void",
+                   {"revision": 2, "reason": "误采：传感器未校准"})
+    print("作废重放:", code, r["effect"])
+    assert code == 201 and r["effect"] == "idempotent"
+    assert call("POST", f"/api/v1/windows/{wv}/readings/m1/void",
+                {"revision": 2, "reason": "别的原因"})[0] == 409
+    assert call("POST", f"/api/v1/windows/{wv}/readings/m1/void",
+                {"revision": 3, "reason": "再次作废"})[0] == 409
+    assert call("POST", f"/api/v1/windows/{wv}/readings/ghost/void",
+                {"revision": 1, "reason": "x"})[0] == 404
+    assert call("POST", f"/api/v1/windows/{wv}/readings/m1/void",
+                {"revision": 4, "reason": "  "})[0] == 422
+    print("原因冲突/重复作废 409、从未存在 404、空原因 422 均已确认")
+
+    # 修订历史：rev1 superseded、rev2 voided（留存原因/操作时间/前一版本）
+    code, hist = call("GET", f"/api/v1/windows/{wv}/readings/m1/revisions")
+    print("修订历史:", [(x["revision"], x["status"]) for x in hist])
+    assert [(x["revision"], x["status"]) for x in hist] == [(1, "superseded"), (2, "voided")]
+    assert hist[1]["void"]["previous"]["revision"] == 1
+
+    # 作废后签发 v2：快照剔除 m1；修订影响报告 v1->v2 呈现 removed；v1 快照不变
+    cv2 = call("POST", f"/api/v1/windows/{wv}/certificates/issue", {"note": "作废后"})[1]
+    assert {x["reading_id"] for x in cv2["snapshot"]["readings"]} == {"m0", "m2", "m3"}
+    code, rep = call("GET", f"/api/v1/certificates/revision-report"
+                            f"?old_certificate_id={cv1['id']}&new_certificate_id={cv2['id']}")
+    print("v1->v2 removed:", [x["reading_id"] for x in rep["readings_diff"]["removed"]])
+    assert [x["reading_id"] for x in rep["readings_diff"]["removed"]] == ["m1"]
+    old = call("GET", f"/api/v1/certificates/{cv1['id']}")[1]
+    assert {x["reading_id"] for x in old["snapshot"]["readings"]} == {"m0", "m1", "m2", "m3"}
+
+    # 恢复：更高修订号提交 -> restored；旧版提交不得复活 -> 409；批量恢复亦可
+    code, r = submit(wv, "m1", 3, 1, 23.0)
+    print("单条恢复:", code, r["effect"], "->", summary(r["current_evaluation"]))
+    assert code == 201 and r["effect"] == "restored"
+    assert r["current_evaluation"]["verdict"] == "fail"
+    code, r = call("POST", f"/api/v1/windows/{wv}/readings/m1/void",
+                   {"revision": 4, "reason": "复核仍为误采"})
+    assert code == 201
+    code, r = submit(wv, "m1", 3, 1, 23.0)  # 等/低于作废修订号，不得复活
+    print("旧版提交试图复活:", code, "-", r["detail"][:50], "...")
+    assert code == 409
+    code, r = submit_batch(wv, [item("m1", 5, 1, 23.0)])
+    print("批量恢复:", code, [x["effect"] for x in r["results"]])
+    assert code == 201 and [x["effect"] for x in r["results"]] == ["restored"]
+
+    # 恢复后签发 v3：修订影响报告 v2->v3 呈现 added（读数再出现）
+    cv3 = call("POST", f"/api/v1/windows/{wv}/certificates/issue", {"note": "恢复后"})[1]
+    code, rep = call("GET", f"/api/v1/certificates/revision-report"
+                            f"?old_certificate_id={cv2['id']}&new_certificate_id={cv3['id']}")
+    added = [(x["reading_id"], x["revision"]) for x in rep["readings_diff"]["added"]]
+    print("v2->v3 added:", added, "；结论:", rep["summary"]["conclusion_zh"][:60], "...")
+    assert added == [("m1", 5)]
 
     print("\n全部示例执行完成 ✔")
 

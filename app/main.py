@@ -17,8 +17,11 @@ from .schemas import (
     ReadingBatchSubmit,
     ReadingBatchSubmitResponse,
     ReadingOut,
+    ReadingRevisionOut,
     ReadingSubmit,
     ReadingSubmitResponse,
+    ReadingVoidResponse,
+    ReadingVoidSubmit,
     RevisionReportOut,
     WindowCreate,
     WindowOut,
@@ -38,11 +41,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
-        "支持读数修订、幂等提交（单条与批量补传）、证书版本化签发，"
+        "支持读数修订、幂等提交（单条与批量补传）、馆员作废与恢复、"
+        "证书版本化签发，"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告。"
     ),
     lifespan=lifespan,
@@ -162,6 +166,59 @@ def submit_reading_batch(
                         for effect, reading in results],
             "current_evaluation": evaluation,
         }
+
+
+@app.post(
+    "/api/v1/windows/{window_id}/readings/{reading_id}/void",
+    response_model=ReadingVoidResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["readings"],
+)
+def void_reading(
+    window_id: int,
+    reading_id: str,
+    payload: ReadingVoidSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员作废当前读数（误采确认）。
+
+    凭窗口、reading_id、递增修订号（须高于当前修订号）与非空原因作废：
+    作废作为该 ID 的一条修订留存（原因、操作时间、前一版本），当前审定
+    立即剔除该读数并在同一事务内重算。
+
+    - 相同作废修订号 + 相同原因重放 -> 幂等（effect=idempotent）；
+      原因不同或修订号不更高 -> 409；
+    - 读数从未存在 -> 404；已作废的读数不能再次以新修订号作废 -> 409；
+    - 恢复：以更高修订号重新提交该读数（单条或批量均可，effect=restored）。
+    """
+    # 单个写事务：校验 + 作废落库 + 基于同一状态立即重算
+    with write_transaction(conn):
+        win = services.get_window_row(conn, window_id)
+        effect, void_detail = services.void_reading(conn, window_id, reading_id, payload)
+        evaluation = services.compute_evaluation(conn, win)
+        return {
+            "effect": effect,
+            "reading_id": reading_id,
+            "revision": payload.revision,
+            "void": void_detail,
+            "current_evaluation": evaluation,
+        }
+
+
+@app.get(
+    "/api/v1/windows/{window_id}/readings/{reading_id}/revisions",
+    response_model=list[ReadingRevisionOut],
+    tags=["readings"],
+)
+def list_reading_revisions(
+    window_id: int, reading_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> list[dict[str, Any]]:
+    """该读数 ID 的全部修订历史（按修订号升序），含作废留存。
+
+    作废修订（status=voided）附 void：原因、操作时间与前一版本；
+    读数从未存在返回 404。
+    """
+    return services.list_reading_revisions(conn, window_id, reading_id)
 
 
 # ---------------------------------------------------------------- 签发
